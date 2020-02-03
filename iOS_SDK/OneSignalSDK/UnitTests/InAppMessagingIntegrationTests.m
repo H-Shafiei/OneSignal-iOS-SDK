@@ -28,6 +28,7 @@
 #import <XCTest/XCTest.h>
 #import "OneSignal.h"
 #import "OneSignalHelper.h"
+#import "OneSignalUserDefaults.h"
 #import "OSInAppMessage.h"
 #import "OSTrigger.h"
 #import "OSTriggerController.h"
@@ -81,6 +82,7 @@
     OneSignalOverrider.shouldOverrideSessionLaunchTime = false;
     
     [OSMessagingController.sharedInstance resetState];
+    [OSMessagingControllerOverrider reset];
     
     NSTimerOverrider.shouldScheduleTimers = true;
     
@@ -137,7 +139,10 @@
     [UnitTestCommonMethods initOneSignalAndThreadWait];
     
     XCTAssertFalse(NSTimerOverrider.hasScheduledTimer);
-    XCTAssertTrue(OSMessagingControllerOverrider.messageDisplayQueue.count == 2);
+    
+    // We need to dismiss the first IAM show
+    [OSMessagingControllerOverrider dismissCurrentMessage];
+    XCTAssertEqual(2, OSMessagingControllerOverrider.messageDisplayQueue.count);
 }
 
 - (void)testMessageDisplayedAfterTimer {
@@ -181,6 +186,122 @@
     XCTAssertTrue(NSTimerOverrider.hasScheduledTimer);
 }
 
+- (void)testMessageWithRedisplay {
+    let limit = 5;
+    let delay = 60;
+    let firstTrigger = [OSTrigger customTriggerWithProperty:@"prop1" withOperator:OSTriggerOperatorTypeExists withValue:nil];
+
+    let message = [OSInAppMessageTestHelper testMessageWithTriggers:@[@[firstTrigger]] withRedisplayLimit:limit delay:@(delay)];
+    
+    //Time interval mock
+    NSDateComponents* comps = [[NSDateComponents alloc]init];
+    comps.year = 2019;
+    comps.month = 6;
+    comps.day = 10;
+    comps.hour = 10;
+    comps.minute = 1;
+
+    NSCalendar* calendar = [NSCalendar currentCalendar];
+    NSDate* date = [calendar dateFromComponents:comps];
+    NSTimeInterval firstInterval = [date timeIntervalSince1970];
+    
+    [self initOneSignalWithInAppMessage:message];
+    [OSMessagingControllerOverrider setMockDateGenerator: ^NSTimeInterval(void) {
+        return firstInterval;
+    }];
+    
+    [OneSignal addTrigger:@"prop1" withValue:@2];
+    
+    // IAM should be shown instantly and be within the messageDisplayQueue
+    XCTAssertTrue(OSMessagingControllerOverrider.messageDisplayQueue.count == 1);
+    
+    let iamDisplayed = [OSMessagingControllerOverrider.messageDisplayQueue objectAtIndex:0];
+    XCTAssertTrue(iamDisplayed.displayStats.lastDisplayTime == -1);
+    
+    [OSMessagingControllerOverrider dismissCurrentMessage];
+    
+    XCTAssertTrue(OSMessagingControllerOverrider.messagesForRedisplay.count == 1);
+    OSInAppMessage *dismissedMessage = [[OSMessagingControllerOverrider.messagesForRedisplay allObjects] objectAtIndex:0];
+    let lastDisplayTime = dismissedMessage.displayStats.lastDisplayTime;
+    XCTAssertEqual(1, dismissedMessage.displayStats.displayQuantity);
+    XCTAssertEqual(firstInterval, lastDisplayTime);
+    
+    XCTAssertTrue(OSMessagingControllerOverrider.messageDisplayQueue.count == 1);
+    
+    comps.minute = 1 + ceil(delay/60); // delay/60 -> minutes
+
+    NSDate* secondDate = [calendar dateFromComponents:comps];
+    NSTimeInterval secondInterval = [secondDate timeIntervalSince1970];
+   
+    [OSMessagingControllerOverrider setMockDateGenerator: ^NSTimeInterval(void) {
+        return secondInterval;
+    }];
+    
+    [OneSignal addTrigger:@"prop1" withValue:@2];
+    
+    XCTAssertTrue(OSMessagingControllerOverrider.messageDisplayQueue.count == 2);
+    
+    [OSMessagingControllerOverrider dismissCurrentMessage];
+    
+    XCTAssertTrue(OSMessagingControllerOverrider.messagesForRedisplay.count == 1);
+    OSInAppMessage *secondDismissedMessage = [[OSMessagingControllerOverrider.messagesForRedisplay allObjects] objectAtIndex:0];
+    let secondLastDisplayTime = secondDismissedMessage.displayStats.lastDisplayTime;
+    XCTAssertEqual(2, secondDismissedMessage.displayStats.displayQuantity);
+    XCTAssertEqual(secondInterval, secondLastDisplayTime);
+    XCTAssertTrue(secondLastDisplayTime - firstInterval >= delay);
+}
+
+- (void)testMessageWithRedisplayClickedLaunchesAPIRequestMultipleTimes {
+    let limit = 5;
+    let delay = 60;
+    let firstTrigger = [OSTrigger customTriggerWithProperty:@"prop1" withOperator:OSTriggerOperatorTypeExists withValue:nil];
+
+    let message = [OSInAppMessageTestHelper testMessageWithTriggers:@[@[firstTrigger]] withRedisplayLimit:limit delay:@(delay)];
+    let registrationResponse = [OSInAppMessageTestHelper testRegistrationJsonWithMessages:@[message.jsonRepresentation]];
+    
+    [OneSignalClientOverrider setMockResponseForRequest:NSStringFromClass([OSRequestRegisterUser class]) withResponse:registrationResponse];
+    
+    [UnitTestCommonMethods initOneSignalAndThreadWait];
+    
+    // the message should now be displayed
+    // simulate a button press (action) on the inapp message
+    let action = [OSInAppMessageAction new];
+    action.clickType = @"button";
+    action.clickId = @"test_action_id";
+    
+    [OSMessagingController.sharedInstance messageViewDidSelectAction:message withAction:action];
+    // The action should cause an "opened" API request
+    XCTAssertEqualObjects(OneSignalClientOverrider.lastHTTPRequestType, NSStringFromClass([OSRequestInAppMessageClicked class]));
+    
+    let standardUserDefaults = OneSignalUserDefaults.initStandard;
+    let clickedClickIds = [[NSMutableSet alloc] initWithSet:[standardUserDefaults getSavedSetForKey:OS_IAM_CLICKED_SET_KEY defaultValue:nil]];
+    
+    XCTAssertTrue(clickedClickIds.count == 1);
+    NSString *clickedId = [[clickedClickIds allObjects] objectAtIndex:0];
+    
+    XCTAssertEqual(action.clickId, clickedId);
+    XCTAssertEqual(1, [message getClickedClickIds].count);
+    XCTAssertEqual(action.clickId, [[message.getClickedClickIds allObjects] objectAtIndex:0]);
+    
+    [message clearClickIds];
+    [OneSignalClientOverrider reset:self];
+    XCTAssertEqual(0, [message getClickedClickIds].count);
+    XCTAssertEqualObjects(nil, OneSignalClientOverrider.lastHTTPRequestType);
+    
+    [OSMessagingController.sharedInstance messageViewDidSelectAction:message withAction:action];
+    // The action should cause an "opened" API request again
+    XCTAssertEqualObjects(OneSignalClientOverrider.lastHTTPRequestType, NSStringFromClass([OSRequestInAppMessageClicked class]));
+    
+    let secondClickedClickIds = [[NSMutableSet alloc] initWithSet:[standardUserDefaults getSavedSetForKey:OS_IAM_CLICKED_SET_KEY defaultValue:nil]];
+    
+    XCTAssertTrue(secondClickedClickIds.count == 1);
+    NSString *secondClickedId = [[secondClickedClickIds allObjects] objectAtIndex:0];
+       
+    XCTAssertEqual(action.clickId, secondClickedId);
+    XCTAssertEqual(1, [message getClickedClickIds].count);
+    XCTAssertEqual(action.clickId, [[message.getClickedClickIds allObjects] objectAtIndex:0]);
+}
+
 // Tests adding & removing trigger values using the public OneSignal trigger methods
 - (void)testRemoveTriggers {
     [UnitTestCommonMethods initOneSignalAndThreadWait];
@@ -209,6 +330,33 @@
     [OneSignal removeTriggerForKey:@"test3"];
     
     XCTAssertTrue([OneSignal getTriggers].count == 0);
+}
+
+- (void)testRemoveTriggersWithMessageRedisplay {
+     let limit = 5;
+     let delay = 60;
+     let firstTrigger = [OSTrigger customTriggerWithProperty:@"prop1" withOperator:OSTriggerOperatorTypeNotExists withValue:nil];
+
+     let message = [OSInAppMessageTestHelper testMessageWithTriggers:@[@[firstTrigger]] withRedisplayLimit:limit delay:@(delay)];
+     
+     //Time interval mock
+     NSDateComponents* comps = [[NSDateComponents alloc]init];
+     comps.year = 2019;
+     comps.month = 6;
+     comps.day = 10;
+     comps.hour = 10;
+     comps.minute = 1;
+
+     NSCalendar* calendar = [NSCalendar currentCalendar];
+     NSDate* date = [calendar dateFromComponents:comps];
+     NSTimeInterval firstInterval = [date timeIntervalSince1970];
+     
+     [self initOneSignalWithInAppMessage:message];
+     [OSMessagingControllerOverrider setMockDateGenerator: ^NSTimeInterval(void) {
+         return [date timeIntervalSince1970];
+     }];
+    
+     [OneSignal addTrigger:@"prop1" withValue:@2];
 }
 
 - (void)testTimeSinceLastInAppMessageTrigger_withNoPreviousInAppMessages {

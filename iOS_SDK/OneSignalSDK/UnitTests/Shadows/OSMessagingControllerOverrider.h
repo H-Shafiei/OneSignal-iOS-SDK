@@ -35,8 +35,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (class, nonatomic) NSArray<OSInAppMessage *> *messageDisplayQueue;
 
++ (void)dismissCurrentMessage;
 + (void)reset;
++ (void)setMockDateGenerator:(NSTimeInterval(^)(void))testDateGenerator;
 + (BOOL)isInAppMessageShowing;
++ (NSMutableSet <OSInAppMessage *> *)messagesForRedisplay;
 
 @end
 
@@ -44,6 +47,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)resetState;
 - (void)messageViewDidSelectAction:(OSInAppMessage *)message withAction:(OSInAppMessageAction *)action;
+- (void)persisIAMessageForReDisplay:(OSInAppMessage *)message;
+- (void)messageViewControllerWasDismissed;
+- (void)setLastTimeGenerator:(NSTimeInterval(^)(void))dateGenerator;
+- (NSMutableSet <OSInAppMessage *> *)getRedisplayInAppMessages;
 
 @end
 
